@@ -175,6 +175,21 @@ absl::StatusOr<CleanableFd> GetSubprocessHelperFd() {
   }
   return std::move(fd);
 }
+
+#else
+int AddChdirFileAction(posix_spawn_file_actions_t* file_actions,
+                       const char* cwd) {
+#if defined(__MAC_26_0) && __MAC_OS_X_VERSION_MIN_REQUIRED >= __MAC_26_0
+  return posix_spawn_file_actions_addchdir(file_actions, cwd);
+#else
+#if defined(__MAC_26_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_26_0
+  if (__builtin_available(macOS 26.0, *)) {
+    return posix_spawn_file_actions_addchdir(file_actions, cwd);
+  }
+#endif
+  return posix_spawn_file_actions_addchdir_np(file_actions, cwd);
+#endif
+}
 #endif
 
 absl::StatusOr<pid_t> ExecInChildProcess(
@@ -188,41 +203,39 @@ absl::StatusOr<pid_t> ExecInChildProcess(
   // better, but it's not fully clear what's safe between vfork() and exec()
   // either, so we just use posix_spawn for safety and convenience.
 
-  std::string executable;
-  std::vector<const char*> child_argv_pointers;
 #if defined(__APPLE__)
-  // Darwin has a posix_spawn file action for changing directory, so it can
-  // launch the requested executable directly.
-  executable = argv_pointers.front();
-  child_argv_pointers = argv_pointers;
+  // Darwin can change the child directory without a helper executable.
+  std::string subprocess_helper = argv_pointers.front();
+  std::vector<const char*> helper_argv_pointers = argv_pointers;
 #else
   // Since we may need the child to have a different working directory (per
   // `cwd`), and posix_spawn does not (yet) have support for a chdir action, we
   // use a helper binary that chdir's to its first argument, then invokes
   // "execvp" with the remaining arguments to replace itself with the command we
-  // actually wanted to run. To avoid a dependency on Bazel build artifacts, run
-  // subprocess_helper out of a memfd.
+  // actually wanted to run.
+
+  // To avoid having dependencies on the bazel build artifacts continuing to
+  // exist we run subprocess_helper out of a memfd.
   static const absl::StatusOr<CleanableFd> subprocess_helper_fd =
       GetSubprocessHelperFd();
   XLS_RETURN_IF_ERROR(subprocess_helper_fd.status());
   int fd = *subprocess_helper_fd;
 
   std::string subprocess_helper = absl::StrCat("/proc/self/fd/", fd);
-  executable = subprocess_helper;
-  child_argv_pointers.reserve(argv_pointers.size() + 2);
-  child_argv_pointers.push_back(executable.c_str());
-  child_argv_pointers.push_back(cwd.has_value() ? cwd->c_str() : "");
-  child_argv_pointers.insert(child_argv_pointers.end(), argv_pointers.begin(),
-                             argv_pointers.end());
+  std::vector<const char*> helper_argv_pointers;
+  helper_argv_pointers.reserve(argv_pointers.size() + 2);
+  helper_argv_pointers.push_back(subprocess_helper.c_str());
+  helper_argv_pointers.push_back(cwd.has_value() ? cwd->c_str() : "");
+  helper_argv_pointers.insert(helper_argv_pointers.end(), argv_pointers.begin(),
+                              argv_pointers.end());
+
 #endif
 
   XLS_ASSIGN_OR_RETURN(posix_spawn_file_actions_t file_actions,
                        CreateChildFileActions(stdout_pipe, stderr_pipe));
 #if defined(__APPLE__)
   if (cwd.has_value()) {
-    if (int err =
-            posix_spawn_file_actions_addchdir_np(&file_actions, cwd->c_str());
-        err != 0) {
+    if (int err = AddChdirFileAction(&file_actions, cwd->c_str()); err != 0) {
       posix_spawn_file_actions_destroy(&file_actions);
       return absl::InternalError(absl::StrCat(
           "Cannot add child working directory action: ", Strerror(err)));
@@ -255,8 +268,8 @@ absl::StatusOr<pid_t> ExecInChildProcess(
   }
   pid_t pid;
   if (int err = posix_spawnp(
-          &pid, executable.c_str(), &file_actions, nullptr,
-          const_cast<char* const*>(child_argv_pointers.data()), child_env);
+          &pid, subprocess_helper.c_str(), &file_actions, nullptr,
+          const_cast<char* const*>(helper_argv_pointers.data()), child_env);
       err != 0) {
     return absl::InternalError(
         absl::StrCat("Cannot spawn child process: ", Strerror(err)));
