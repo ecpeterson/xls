@@ -29,8 +29,6 @@
 #include <utility>
 #include <vector>
 
-#include "gmock/gmock.h"
-#include "gtest/gtest.h"
 #include "absl/base/casts.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -45,6 +43,8 @@
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
 #include "xls/codegen/block_conversion_test_fixture.h"
 #include "xls/codegen/codegen_options.h"
 #include "xls/codegen/codegen_pass.h"
@@ -143,6 +143,120 @@ class BlockConversionTest : public BlockConversionTestFixture {
     return CodegenOptions().module_name(TestName());
   }
 };
+
+TEST_F(BlockConversionTest, ZeroLatencyBufferReplacesPoppedElement) {
+  Package package(TestName());
+  BlockBuilder bb("zero_latency_buffer", &package);
+  bb.AddClockPort("clk");
+  bb.ResetPort("rst",
+               ResetBehavior{.asynchronous = false, .active_low = false});
+  BValue from_data = bb.InputPort("from_data", package.GetBitsType(8));
+  BValue from_valid = bb.InputPort("from_valid", package.GetBitsType(1));
+  BValue to_ready = bb.InputPort("to_ready", package.GetBitsType(1));
+  bb.OutputPort("to_data", from_data);
+  bb.OutputPort("to_valid", from_valid);
+  BValue from_ready = bb.OutputPort("from_ready", to_ready);
+  XLS_ASSERT_OK_AND_ASSIGN(Block * block, bb.Build());
+
+  std::vector<std::optional<Node*>> valid_nodes;
+  XLS_ASSERT_OK(AddZeroLatencyBufferToRDVNodes(
+                    from_data.node(), from_valid.node(), from_ready.node(),
+                    "buffer", block, valid_nodes,
+                    ZeroLatencyBufferReadyMode::kCurrentCycle)
+                    .status());
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> inputs = {
+      {{"rst", 1}, {"from_data", 0}, {"from_valid", 0}, {"to_ready", 0}},
+      {{"rst", 0}, {"from_data", 11}, {"from_valid", 1}, {"to_ready", 0}},
+      {{"rst", 0}, {"from_data", 22}, {"from_valid", 1}, {"to_ready", 1}},
+      {{"rst", 0}, {"from_data", 0}, {"from_valid", 0}, {"to_ready", 1}},
+      {{"rst", 0}, {"from_data", 0}, {"from_valid", 0}, {"to_ready", 1}},
+  };
+  XLS_ASSERT_OK_AND_ASSIGN(auto outputs,
+                           InterpretSequentialBlock(block, inputs));
+
+  // Cycle 2 pops 11 while accepting 22.  The replacement remains buffered
+  // and is presented on cycle 3.
+  EXPECT_EQ(outputs[2].at("from_ready"), 1);
+  EXPECT_EQ(outputs[2].at("to_valid"), 1);
+  EXPECT_EQ(outputs[2].at("to_data"), 11);
+  EXPECT_EQ(outputs[3].at("to_valid"), 1);
+  EXPECT_EQ(outputs[3].at("to_data"), 22);
+  EXPECT_EQ(outputs[4].at("to_valid"), 0);
+}
+
+TEST_F(BlockConversionTest, ZeroLatencyBufferReservesNextCycleRamResponse) {
+  Package package(TestName());
+  BlockBuilder bb("fixed_latency_response_buffer", &package);
+  bb.AddClockPort("clk");
+  bb.ResetPort("rst",
+               ResetBehavior{.asynchronous = false, .active_low = false});
+  BValue response_data = bb.InputPort("response_data", package.GetBitsType(8));
+  BValue response_valid =
+      bb.InputPort("response_valid", package.GetBitsType(1));
+  BValue consumer_ready =
+      bb.InputPort("consumer_ready", package.GetBitsType(1));
+  bb.OutputPort("consumer_data", response_data);
+  bb.OutputPort("consumer_valid", response_valid);
+  BValue request_ready = bb.OutputPort("request_ready", consumer_ready);
+  XLS_ASSERT_OK_AND_ASSIGN(Block * block, bb.Build());
+
+  std::vector<std::optional<Node*>> valid_nodes;
+  XLS_ASSERT_OK(AddZeroLatencyBufferToRDVNodes(
+                    response_data.node(), response_valid.node(),
+                    request_ready.node(), "ram_response", block, valid_nodes,
+                    ZeroLatencyBufferReadyMode::kNextCycle)
+                    .status());
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> inputs = {
+      {{"rst", 1},
+       {"response_data", 0},
+       {"response_valid", 0},
+       {"consumer_ready", 0}},
+      {{"rst", 0},
+       {"response_data", 10},
+       {"response_valid", 1},
+       {"consumer_ready", 1}},
+      {{"rst", 0},
+       {"response_data", 20},
+       {"response_valid", 1},
+       {"consumer_ready", 0}},
+      {{"rst", 0},
+       {"response_data", 0},
+       {"response_valid", 0},
+       {"consumer_ready", 0}},
+      {{"rst", 0},
+       {"response_data", 30},
+       {"response_valid", 1},
+       {"consumer_ready", 1}},
+      {{"rst", 0},
+       {"response_data", 0},
+       {"response_valid", 0},
+       {"consumer_ready", 1}},
+      {{"rst", 0},
+       {"response_data", 0},
+       {"response_valid", 0},
+       {"consumer_ready", 1}},
+  };
+  XLS_ASSERT_OK_AND_ASSIGN(auto outputs,
+                           InterpretSequentialBlock(block, inputs));
+
+  // The back-to-back response on cycle 2 is retained throughout the stall,
+  // and request readiness is suppressed because the next-cycle slot is full.
+  EXPECT_EQ(outputs[2].at("request_ready"), 0);
+  EXPECT_EQ(outputs[3].at("request_ready"), 0);
+  EXPECT_EQ(outputs[3].at("consumer_valid"), 1);
+  EXPECT_EQ(outputs[3].at("consumer_data"), 20);
+
+  // A simultaneous pop/push on cycle 4 replaces 20 with 30.  It still cannot
+  // launch another fixed-latency request until 30 is popped on cycle 5.
+  EXPECT_EQ(outputs[4].at("request_ready"), 0);
+  EXPECT_EQ(outputs[4].at("consumer_data"), 20);
+  EXPECT_EQ(outputs[5].at("request_ready"), 1);
+  EXPECT_EQ(outputs[5].at("consumer_valid"), 1);
+  EXPECT_EQ(outputs[5].at("consumer_data"), 30);
+  EXPECT_EQ(outputs[6].at("consumer_valid"), 0);
+}
 
 // Unit delay delay estimator.
 class TestDelayEstimator : public DelayEstimator {

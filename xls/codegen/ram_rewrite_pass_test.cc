@@ -26,8 +26,7 @@
 #include <variant>
 #include <vector>
 
-#include "gmock/gmock.h"
-#include "gtest/gtest.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -38,6 +37,8 @@
 #include "absl/strings/str_replace.h"
 #include "absl/types/span.h"
 #include "absl/types/variant.h"
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
 #include "xls/codegen/block_conversion.h"
 #include "xls/codegen/codegen_options.h"
 #include "xls/codegen/codegen_pass.h"
@@ -51,6 +52,7 @@
 #include "xls/common/status/status_macros.h"
 #include "xls/common/visitor.h"
 #include "xls/estimators/delay_model/delay_estimators.h"
+#include "xls/interpreter/block_interpreter.h"
 #include "xls/ir/block.h"
 #include "xls/ir/channel.h"
 #include "xls/ir/ir_matcher.h"
@@ -325,6 +327,141 @@ class RamRewritePassTest
     return "";
   }
 };
+
+TEST(RamRewriteHandshakeTest, HeldReadIssuesOnceAfterResponseStall) {
+  constexpr std::string_view kIr = R"(package test
+
+top block held_valid_ram_request(
+    clk: clock, rst: bits[1], source_addr: bits[4],
+    source_valid: bits[1], source_ready: bits[1],
+    consumer_ready: bits[1], consumer_data: bits[32],
+    consumer_valid: bits[1], rd_req_data: (bits[4], ()),
+    rd_req_valid: bits[1], rd_req_ready: bits[1],
+    rd_resp_data: (bits[32]), rd_resp_valid: bits[1],
+    rd_resp_ready: bits[1],
+    wr_req_data: (bits[4], bits[32], ()), wr_req_valid: bits[1],
+    wr_req_ready: bits[1], wr_comp_data: (),
+    wr_comp_valid: bits[1], wr_comp_ready: bits[1]) {
+  #![reset(port="rst", asynchronous=false, active_low=false)]
+  #![channel_ports(name=rd_req, type=(bits[4], ()), direction=send, kind=streaming, data_port=rd_req_data, ready_port=rd_req_ready, valid_port=rd_req_valid)]
+  #![channel_ports(name=rd_resp, type=(bits[32]), direction=receive, kind=streaming, data_port=rd_resp_data, ready_port=rd_resp_ready, valid_port=rd_resp_valid)]
+  #![channel_ports(name=wr_req, type=(bits[4], bits[32], ()), direction=send, kind=streaming, data_port=wr_req_data, ready_port=wr_req_ready, valid_port=wr_req_valid)]
+  #![channel_ports(name=wr_comp, type=(), direction=receive, kind=streaming, data_port=wr_comp_data, ready_port=wr_comp_ready, valid_port=wr_comp_valid)]
+  rst: bits[1] = input_port(name=rst)
+  source_addr: bits[4] = input_port(name=source_addr)
+  source_valid: bits[1] = input_port(name=source_valid)
+  consumer_ready: bits[1] = input_port(name=consumer_ready)
+  rd_req_ready: bits[1] = input_port(name=rd_req_ready)
+  rd_resp_data: (bits[32]) = input_port(name=rd_resp_data)
+  rd_resp_valid: bits[1] = input_port(name=rd_resp_valid)
+  wr_req_ready: bits[1] = input_port(name=wr_req_ready)
+  wr_comp_data: () = input_port(name=wr_comp_data)
+  wr_comp_valid: bits[1] = input_port(name=wr_comp_valid)
+  zero1: bits[1] = literal(value=0)
+  one1: bits[1] = literal(value=1)
+  zero4: bits[4] = literal(value=0)
+  zero32: bits[32] = literal(value=0)
+  empty: () = tuple()
+  held_valid: bits[1] = identity(source_valid)
+  write_valid: bits[1] = identity(zero1)
+  rd_tuple: (bits[4], ()) = tuple(source_addr, empty)
+  wr_tuple: (bits[4], bits[32], ()) = tuple(zero4, zero32, empty)
+  rd_value: bits[32] = tuple_index(rd_resp_data, index=0)
+  rd_req_data: () = output_port(rd_tuple, name=rd_req_data)
+  rd_req_valid: () = output_port(held_valid, name=rd_req_valid)
+  source_ready: () = output_port(rd_req_ready, name=source_ready)
+  consumer_data: () = output_port(rd_value, name=consumer_data)
+  consumer_valid: () = output_port(rd_resp_valid, name=consumer_valid)
+  rd_resp_ready: () = output_port(consumer_ready, name=rd_resp_ready)
+  wr_req_data: () = output_port(wr_tuple, name=wr_req_data)
+  wr_req_valid: () = output_port(write_valid, name=wr_req_valid)
+  wr_comp_ready: () = output_port(one1, name=wr_comp_ready)
+}
+)";
+
+  XLS_ASSERT_OK_AND_ASSIGN(auto package, IrTestBase::ParsePackage(kIr));
+  XLS_ASSERT_OK_AND_ASSIGN(Block * block,
+                           package->GetBlock("held_valid_ram_request"));
+
+  std::vector<RamConfiguration> ram_configurations;
+  ram_configurations.push_back(
+      Ram1R1WConfiguration("ram", 1, "rd_req", "rd_resp", "wr_req", "wr_comp"));
+  const CodegenOptions codegen_options =
+      CodegenOptions()
+          .reset("rst", false, false, false)
+          .ram_configurations(ram_configurations);
+  const CodegenPassOptions pass_options{.codegen_options = codegen_options};
+  CodegenContext context(block);
+  PassResults results;
+  XLS_ASSERT_OK_AND_ASSIGN(
+      bool changed,
+      RamRewritePass().Run(package.get(), pass_options, &results, context));
+  EXPECT_TRUE(changed);
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> inputs = {
+      {{"rst", 1},
+       {"source_addr", 0},
+       {"source_valid", 0},
+       {"consumer_ready", 1},
+       {"ram_rd_data", 0}},
+      {{"rst", 0},
+       {"source_addr", 1},
+       {"source_valid", 1},
+       {"consumer_ready", 1},
+       {"ram_rd_data", 0}},
+      {{"rst", 0},
+       {"source_addr", 2},
+       {"source_valid", 1},
+       {"consumer_ready", 0},
+       {"ram_rd_data", 0xa1}},
+      {{"rst", 0},
+       {"source_addr", 2},
+       {"source_valid", 1},
+       {"consumer_ready", 0},
+       {"ram_rd_data", 0}},
+      {{"rst", 0},
+       {"source_addr", 2},
+       {"source_valid", 1},
+       {"consumer_ready", 1},
+       {"ram_rd_data", 0}},
+      {{"rst", 0},
+       {"source_addr", 0},
+       {"source_valid", 0},
+       {"consumer_ready", 1},
+       {"ram_rd_data", 0xb2}},
+      {{"rst", 0},
+       {"source_addr", 0},
+       {"source_valid", 0},
+       {"consumer_ready", 1},
+       {"ram_rd_data", 0}},
+  };
+  XLS_ASSERT_OK_AND_ASSIGN(auto outputs,
+                           InterpretSequentialBlock(block, inputs));
+
+  // The second request remains valid throughout the response stall, but it
+  // must issue to the physical RAM exactly once, when request ready returns.
+  EXPECT_EQ(outputs[1].at("ram_rd_en"), 1);
+  EXPECT_EQ(outputs[2].at("source_ready"), 0);
+  EXPECT_EQ(outputs[2].at("ram_rd_en"), 0);
+  EXPECT_EQ(outputs[3].at("source_ready"), 0);
+  EXPECT_EQ(outputs[3].at("ram_rd_en"), 0);
+  EXPECT_EQ(outputs[4].at("source_ready"), 1);
+  EXPECT_EQ(outputs[4].at("ram_rd_en"), 1);
+  int64_t read_count = 0;
+  for (const auto& cycle_outputs : outputs) {
+    read_count += cycle_outputs.at("ram_rd_en");
+  }
+  EXPECT_EQ(read_count, 2);
+
+  EXPECT_EQ(outputs[2].at("consumer_valid"), 1);
+  EXPECT_EQ(outputs[2].at("consumer_data"), 0xa1);
+  EXPECT_EQ(outputs[3].at("consumer_valid"), 1);
+  EXPECT_EQ(outputs[3].at("consumer_data"), 0xa1);
+  EXPECT_EQ(outputs[4].at("consumer_valid"), 1);
+  EXPECT_EQ(outputs[4].at("consumer_data"), 0xa1);
+  EXPECT_EQ(outputs[5].at("consumer_valid"), 1);
+  EXPECT_EQ(outputs[5].at("consumer_data"), 0xb2);
+}
 
 TEST_P(RamRewritePassTest, PortsUpdated) {
   auto& param = std::get<0>(GetParam());

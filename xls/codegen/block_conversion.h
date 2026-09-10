@@ -100,10 +100,19 @@ absl::StatusOr<RegisterRead*> AddRegisterAfterNode(
 //
 // Updates valid_nodes with the additional nodes associated with valid
 // registers.
+enum class ZeroLatencyBufferReadyMode {
+  // `from_rdy` describes whether `from_valid` can be accepted now.
+  kCurrentCycle,
+  // `from_rdy` reserves capacity for an input that will arrive next cycle.
+  // This is used by fixed-latency RAM request/response pairs.
+  kNextCycle,
+};
+
 absl::StatusOr<Node*> AddZeroLatencyBufferToRDVNodes(
     Node* from_data, Node* from_valid, Node* from_rdy,
     std::string_view name_prefix, Block* block,
-    std::vector<std::optional<Node*>>& valid_nodes);
+    std::vector<std::optional<Node*>>& valid_nodes,
+    ZeroLatencyBufferReadyMode ready_mode);
 
 // Clones every node in the given proc into the given block. Some nodes are
 // handled specially.  See CloneNodesIntoBlockHandler for details.

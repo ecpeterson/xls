@@ -476,7 +476,8 @@ absl::StatusOr<RegisterRead*> AddRegisterAfterNode(
 absl::StatusOr<Node*> AddZeroLatencyBufferToRDVNodes(
     Node* from_data, Node* from_valid, Node* from_rdy,
     std::string_view name_prefix, Block* block,
-    std::vector<std::optional<Node*>>& valid_nodes) {
+    std::vector<std::optional<Node*>>& valid_nodes,
+    ZeroLatencyBufferReadyMode ready_mode) {
   CHECK_EQ(from_rdy->operand_count(), 1);
 
   // Add a node for load_enables (will be removed later).
@@ -515,31 +516,42 @@ absl::StatusOr<Node*> AddZeroLatencyBufferToRDVNodes(
           /*name=*/absl::StrCat(name_prefix, "_select")));
   XLS_RETURN_IF_ERROR(data_skid_reg_read->ReplaceUsesWith(to_data));
 
-  // Input can be accepted whenever the skid registers
-  // are empty/invalid.
+  // Input can be accepted whenever the skid register is empty, or whenever
+  // the buffered element is being consumed in this cycle.  The latter case
+  // permits the one-entry buffer to replace a popped element without dropping
+  // a simultaneously arriving element.
   Node* to_is_ready = from_rdy->operand(0);
 
   XLS_ASSIGN_OR_RETURN(
-      Node * from_skid_rdy,
+      Node * skid_is_empty,
       block->MakeNodeWithName<UnOp>(
           /*loc=*/SourceInfo(), data_valid_skid_reg_read, Op::kNot,
-          absl::StrCat(name_prefix, "_from_skid_rdy")));
-  XLS_RETURN_IF_ERROR(from_rdy->ReplaceOperandNumber(0, from_skid_rdy));
+          absl::StrCat(name_prefix, "_skid_is_empty")));
+  XLS_ASSIGN_OR_RETURN(
+      Node * skid_input_rdy,
+      block->MakeNodeWithName<NaryOp>(
+          /*loc=*/SourceInfo(), std::vector<Node*>{skid_is_empty, to_is_ready},
+          Op::kOr, absl::StrCat(name_prefix, "_skid_input_rdy")));
 
-  // Skid is loaded from 1st stage whenever
-  //   a) the input is being read (input_ready_and_valid == 1) and
-  //       --> which implies that the skid is invalid
-  //   b) the output is not ready (to_is_ready == 0) and
+  // The arriving element must be stored whenever it cannot bypass an empty
+  // buffer to a ready output: either the prior buffered element is being
+  // popped, or the output is not ready.
   XLS_ASSIGN_OR_RETURN(Node * to_is_not_rdy,
                        block->MakeNodeWithName<UnOp>(
                            /*loc=*/SourceInfo(), to_is_ready, Op::kNot,
                            absl::StrCat(name_prefix, "_to_is_not_rdy")));
+  XLS_ASSIGN_OR_RETURN(
+      Node * skid_must_store,
+      block->MakeNodeWithName<NaryOp>(
+          /*loc=*/SourceInfo(),
+          std::vector<Node*>{data_valid_skid_reg_read, to_is_not_rdy}, Op::kOr,
+          absl::StrCat(name_prefix, "_skid_must_store")));
 
   XLS_ASSIGN_OR_RETURN(
       Node * skid_data_load_en,
       block->MakeNodeWithName<NaryOp>(
           /*loc=*/SourceInfo(),
-          std::vector<Node*>{from_valid, from_skid_rdy, to_is_not_rdy},
+          std::vector<Node*>{from_valid, skid_input_rdy, skid_must_store},
           Op::kAnd, absl::StrCat(name_prefix, "_skid_data_load_en")));
 
   // Skid is reset (valid set to zero) to invalid whenever
@@ -560,6 +572,31 @@ absl::StatusOr<Node*> AddZeroLatencyBufferToRDVNodes(
           std::vector<Node*>{skid_data_load_en, skid_valid_set_zero}, Op::kOr,
           absl::StrCat(name_prefix, "_skid_valid_load_en")));
 
+  // Compute the occupancy after this cycle.  This is also the capacity that a
+  // fixed-latency producer must reserve before launching an input that arrives
+  // on the following cycle.
+  XLS_ASSIGN_OR_RETURN(
+      Node * skid_valid_next,
+      block->MakeNodeWithName<Select>(
+          /*loc=*/SourceInfo(),
+          /*selector=*/skid_valid_load_en,
+          /*cases=*/
+          std::vector<Node*>{data_valid_skid_reg_read, skid_data_load_en},
+          /*default_value=*/std::nullopt,
+          /*name=*/absl::StrCat(name_prefix, "_skid_valid_next")));
+  Node* ready_value = skid_input_rdy;
+  if (ready_mode == ZeroLatencyBufferReadyMode::kNextCycle) {
+    XLS_ASSIGN_OR_RETURN(ready_value,
+                         block->MakeNodeWithName<UnOp>(
+                             /*loc=*/SourceInfo(), skid_valid_next, Op::kNot,
+                             absl::StrCat(name_prefix, "_skid_next_is_empty")));
+  }
+  XLS_ASSIGN_OR_RETURN(Node * from_skid_rdy,
+                       block->MakeNodeWithName<UnOp>(
+                           /*loc=*/SourceInfo(), ready_value, Op::kIdentity,
+                           absl::StrCat(name_prefix, "_from_skid_rdy")));
+  XLS_RETURN_IF_ERROR(from_rdy->ReplaceOperandNumber(0, from_skid_rdy));
+
   XLS_ASSIGN_OR_RETURN(
       RegisterWrite * data_skid_reg_write,
       block->GetUniqueRegisterWrite(data_skid_reg_read->GetRegister()));
@@ -570,17 +607,12 @@ absl::StatusOr<Node*> AddZeroLatencyBufferToRDVNodes(
       RegisterWrite * data_valid_skid_reg_write,
       block->GetUniqueRegisterWrite(data_valid_skid_reg_read->GetRegister()));
 
-  // If the skid valid is being set
-  //   - If it's being set to 1, then the input is being read,
-  //     and the prior data is being stored into the skid
-  //   - If it's being set to 0, then the input is not being read
-  //     and we are clearing the skid and sending the data to the output
-  // this implies that
-  //   skid_valid := skid_valid_load_en ? !skid_valid : skid_valid
+  // A load sets valid, including simultaneous pop/push.  A pop without a load
+  // clears it.
   XLS_RETURN_IF_ERROR(
       data_valid_skid_reg_write->ReplaceExistingLoadEnable(skid_valid_load_en));
   XLS_RETURN_IF_ERROR(
-      data_valid_skid_reg_write->ReplaceOperandNumber(0, from_skid_rdy));
+      data_valid_skid_reg_write->ReplaceOperandNumber(0, skid_data_load_en));
 
   valid_nodes.push_back(to_valid);
 

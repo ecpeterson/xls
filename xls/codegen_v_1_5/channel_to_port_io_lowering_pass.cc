@@ -1294,8 +1294,9 @@ absl::Status UpdateRegisterLoadEn(Node* load_en, Register* reg, Block* block) {
 // Latency: 0 cycles
 // Capacity: 1
 //
-// Breaks the ready signal timing path, but allows combinational valid/data
-// pass-through (zero latency).
+// Allows combinational valid/data pass-through (zero latency).  When occupied,
+// downstream ready propagates upstream so that a pop and push can replace the
+// buffered element in one cycle.
 //
 // Logic will be inserted immediately after from_data and from node.
 // Logic will be inserted immediately before from_rdy,
@@ -1345,46 +1346,49 @@ absl::Status AddZeroLatencyBufferToRDVNodes(Node* from_data, Node* from_valid,
           /*name=*/absl::StrCat(name_prefix, "_select")));
   XLS_RETURN_IF_ERROR(data_skid_reg_read->ReplaceUsesWith(to_data));
 
-  XLS_ASSIGN_OR_RETURN(
-      Node * from_skid_rdy,
-      block->MakeNodeWithName<UnOp>(
-          /*loc=*/SourceInfo(), data_valid_skid_reg_read, Op::kNot,
-          absl::StrCat(name_prefix, "_from_skid_rdy")));
-
-  // Skid is loaded from 1st stage whenever
-  //   a) the input is being read (input_ready_and_valid == 1) and
-  //       --> which implies that the skid is invalid
-  //   b) the output is not ready (to_is_ready == 0), if available
-  std::vector<Node*> skid_data_load_en_srcs = {from_valid, from_skid_rdy};
-
-  // Skid is reset to invalid (valid is set to zero) whenever
-  //   a) skid is valid and
-  //   b) output is ready, if available
-  std::vector<Node*> skid_valid_set_zero_srcs = {data_valid_skid_reg_read};
+  // A valid-data channel has no backpressure and is therefore always ready.
+  Node* to_is_ready = literal_1;
 
   if (has_ready) {
-    // Input can be accepted whenever the skid registers
-    // are empty/invalid.
-    Node* to_is_ready = (*from_rdy)->operand(0);
-    XLS_RETURN_IF_ERROR((*from_rdy)->ReplaceOperandNumber(0, from_skid_rdy));
-    XLS_ASSIGN_OR_RETURN(Node * to_is_not_rdy,
-                         block->MakeNodeWithName<UnOp>(
-                             /*loc=*/SourceInfo(), to_is_ready, Op::kNot,
-                             absl::StrCat(name_prefix, "_to_is_not_rdy")));
-    skid_data_load_en_srcs.push_back(to_is_not_rdy);
-    skid_valid_set_zero_srcs.push_back(to_is_ready);
+    to_is_ready = (*from_rdy)->operand(0);
   }
 
   XLS_ASSIGN_OR_RETURN(
+      Node * skid_is_empty,
+      block->MakeNodeWithName<UnOp>(
+          /*loc=*/SourceInfo(), data_valid_skid_reg_read, Op::kNot,
+          absl::StrCat(name_prefix, "_skid_is_empty")));
+  XLS_ASSIGN_OR_RETURN(
+      Node * from_skid_rdy,
+      block->MakeNodeWithName<NaryOp>(
+          /*loc=*/SourceInfo(), std::vector<Node*>{skid_is_empty, to_is_ready},
+          Op::kOr, absl::StrCat(name_prefix, "_from_skid_rdy")));
+  if (has_ready) {
+    XLS_RETURN_IF_ERROR((*from_rdy)->ReplaceOperandNumber(0, from_skid_rdy));
+  }
+
+  XLS_ASSIGN_OR_RETURN(Node * to_is_not_rdy,
+                       block->MakeNodeWithName<UnOp>(
+                           /*loc=*/SourceInfo(), to_is_ready, Op::kNot,
+                           absl::StrCat(name_prefix, "_to_is_not_rdy")));
+  XLS_ASSIGN_OR_RETURN(
+      Node * skid_must_store,
+      block->MakeNodeWithName<NaryOp>(
+          /*loc=*/SourceInfo(),
+          std::vector<Node*>{data_valid_skid_reg_read, to_is_not_rdy}, Op::kOr,
+          absl::StrCat(name_prefix, "_skid_must_store")));
+  XLS_ASSIGN_OR_RETURN(
       Node * skid_data_load_en,
       block->MakeNodeWithName<NaryOp>(
-          /*loc=*/SourceInfo(), skid_data_load_en_srcs, Op::kAnd,
-          absl::StrCat(name_prefix, "_skid_data_load_en")));
+          /*loc=*/SourceInfo(),
+          std::vector<Node*>{from_valid, from_skid_rdy, skid_must_store},
+          Op::kAnd, absl::StrCat(name_prefix, "_skid_data_load_en")));
 
   XLS_ASSIGN_OR_RETURN(
       Node * skid_valid_set_zero,
       block->MakeNodeWithName<NaryOp>(
-          /*loc=*/SourceInfo(), skid_valid_set_zero_srcs, Op::kAnd,
+          /*loc=*/SourceInfo(),
+          std::vector<Node*>{data_valid_skid_reg_read, to_is_ready}, Op::kAnd,
           absl::StrCat(name_prefix, "_skid_valid_set_zero")));
 
   // Skid valid changes from 0 to 1 (load), or 1 to 0 (set zero).
@@ -1402,15 +1406,10 @@ absl::Status AddZeroLatencyBufferToRDVNodes(Node* from_data, Node* from_valid,
       RegisterWrite * data_valid_skid_reg_write,
       block->GetUniqueRegisterWrite(data_valid_skid_reg_read->GetRegister()));
 
-  // If the skid valid is being set
-  //   - If it's being set to 1, then the input is being read,
-  //     and the prior data is being stored into the skid
-  //   - If it's being set to 0, then the input is not being read
-  //     and we are clearing the skid and sending the data to the output
-  // this implies that
-  //   skid_valid := skid_valid_load_en ? !skid_valid : skid_valid
+  // A load sets valid, including simultaneous pop/push.  A pop without a load
+  // clears it.
   XLS_RETURN_IF_ERROR(
-      data_valid_skid_reg_write->ReplaceOperandNumber(0, from_skid_rdy));
+      data_valid_skid_reg_write->ReplaceOperandNumber(0, skid_data_load_en));
   XLS_RETURN_IF_ERROR(UpdateRegisterLoadEn(
       skid_valid_load_en, data_valid_skid_reg_read->GetRegister(), block));
 
