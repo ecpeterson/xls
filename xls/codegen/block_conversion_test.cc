@@ -144,6 +144,46 @@ class BlockConversionTest : public BlockConversionTestFixture {
   }
 };
 
+TEST_F(BlockConversionTest, ZeroLatencyBufferReplacesPoppedElement) {
+  Package package(TestName());
+  BlockBuilder bb("zero_latency_buffer", &package);
+  bb.AddClockPort("clk");
+  bb.ResetPort("rst",
+               ResetBehavior{.asynchronous = false, .active_low = false});
+  BValue from_data = bb.InputPort("from_data", package.GetBitsType(8));
+  BValue from_valid = bb.InputPort("from_valid", package.GetBitsType(1));
+  BValue to_ready = bb.InputPort("to_ready", package.GetBitsType(1));
+  bb.OutputPort("to_data", from_data);
+  bb.OutputPort("to_valid", from_valid);
+  BValue from_ready = bb.OutputPort("from_ready", to_ready);
+  XLS_ASSERT_OK_AND_ASSIGN(Block * block, bb.Build());
+
+  std::vector<std::optional<Node*>> valid_nodes;
+  XLS_ASSERT_OK(AddZeroLatencyBufferToRDVNodes(
+                    from_data.node(), from_valid.node(), from_ready.node(),
+                    "buffer", block, valid_nodes)
+                    .status());
+
+  std::vector<absl::flat_hash_map<std::string, uint64_t>> inputs = {
+      {{"rst", 1}, {"from_data", 0}, {"from_valid", 0}, {"to_ready", 0}},
+      {{"rst", 0}, {"from_data", 11}, {"from_valid", 1}, {"to_ready", 0}},
+      {{"rst", 0}, {"from_data", 22}, {"from_valid", 1}, {"to_ready", 1}},
+      {{"rst", 0}, {"from_data", 0}, {"from_valid", 0}, {"to_ready", 1}},
+      {{"rst", 0}, {"from_data", 0}, {"from_valid", 0}, {"to_ready", 1}},
+  };
+  XLS_ASSERT_OK_AND_ASSIGN(auto outputs,
+                           InterpretSequentialBlock(block, inputs));
+
+  // Cycle 2 pops 11 while accepting 22.  The replacement remains buffered
+  // and is presented on cycle 3.
+  EXPECT_EQ(outputs[2].at("from_ready"), 1);
+  EXPECT_EQ(outputs[2].at("to_valid"), 1);
+  EXPECT_EQ(outputs[2].at("to_data"), 11);
+  EXPECT_EQ(outputs[3].at("to_valid"), 1);
+  EXPECT_EQ(outputs[3].at("to_data"), 22);
+  EXPECT_EQ(outputs[4].at("to_valid"), 0);
+}
+
 // Unit delay delay estimator.
 class TestDelayEstimator : public DelayEstimator {
  public:
