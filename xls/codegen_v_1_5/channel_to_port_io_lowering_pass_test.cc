@@ -567,6 +567,37 @@ TEST_F(ChannelToPortIoLoweringPassTest, StreamingInputSkid) {
               Contains(m::RegisterRead(HasSubstr("__a_in_reg"))));
 }
 
+TEST_F(ChannelToPortIoLoweringPassTest, SkidBufferIsolatesReadyTimingPath) {
+  auto p = std::make_unique<Package>("test");
+  ScheduledProcBuilder pb(NewStyleProc(), "test_main", p.get());
+  BSendChannel a_out = pb.AddOutputChannel("a_out", p->GetBitsType(32));
+  a_out.channel_interface()->SetFlopKind(FlopKind::kSkid);
+  pb.Send(a_out, pb.Literal(Value::Token()), pb.Literal(Value(UBits(123, 32))));
+  XLS_ASSERT_OK(pb.Build());
+  XLS_ASSERT_OK(Run(p.get()).status());
+  XLS_ASSERT_OK_AND_ASSIGN(Block * block, p->GetBlock("test_main"));
+  XLS_ASSERT_OK_AND_ASSIGN(InputPort * downstream_ready,
+                           block->GetInputPort("a_out_rdy"));
+  XLS_ASSERT_OK_AND_ASSIGN(Register * input_register,
+                           block->GetRegister("__a_out_reg"));
+  XLS_ASSERT_OK_AND_ASSIGN(RegisterWrite * input_write,
+                           block->GetUniqueRegisterWrite(input_register));
+  ASSERT_TRUE(input_write->load_enable().has_value());
+
+  // Downstream readiness must not reach the input stage combinationally.
+  // Stop traversing at registers, which provide the required timing boundary.
+  std::vector<Node*> pending = {*input_write->load_enable()};
+  while (!pending.empty()) {
+    Node* node = pending.back();
+    pending.pop_back();
+    ASSERT_NE(node, downstream_ready);
+    if (!node->Is<RegisterRead>()) {
+      pending.insert(pending.end(), node->operands().begin(),
+                     node->operands().end());
+    }
+  }
+}
+
 TEST_F(ChannelToPortIoLoweringPassTest, StreamingOutputFlop) {
   auto p = std::make_unique<Package>("test");
   ScheduledProcBuilder pb(NewStyleProc(), "test_main", p.get());
